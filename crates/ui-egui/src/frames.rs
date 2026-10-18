@@ -93,6 +93,8 @@ struct Job {
     scale: f32,
     project: Arc<Project>,
     prio: u32,
+    /// The picture slot it is for ([`FrameServer::request_in_view`]).
+    view: u32,
 }
 
 struct Shared {
@@ -100,8 +102,8 @@ struct Shared {
     cv: Condvar,
     done: Mutex<Cache>,
     plans: Mutex<PlanCache>,
-    /// Running jobs: key, cancel flag, prefetch.
-    in_flight: Mutex<Vec<(FrameKey, Arc<std::sync::atomic::AtomicBool>, bool)>>,
+    /// Running jobs: key, cancel flag, prefetch, view.
+    in_flight: Mutex<Vec<(FrameKey, Arc<std::sync::atomic::AtomicBool>, bool, u32)>>,
     /// Per-job timings, collected while profiling is on (benchmarks, `ui.inspect`).
     profiling: AtomicBool,
     records: Mutex<Vec<JobRecord>>,
@@ -518,10 +520,20 @@ impl FrameServer {
     /// non-reference pictures, while nearby frames stay decoded (and cached) for scrubbing back.
     pub fn request(&self, key: FrameKey, time: Tick, scale: f32, project: &Arc<Project>, prio: u32) {
         let late = (prio == 0).then(|| Tick::from_seconds_f64(SCRUB_KEEP_S));
-        self.request_job(key, time, scale, project, prio, false, late);
+        self.request_job(key, time, scale, project, prio, false, late, 0);
     }
 
-    fn request_job(&self, key: FrameKey, time: Tick, scale: f32, project: &Arc<Project>, prio: u32, prefetch: bool, catch_up: Option<Tick>) {
+    /// [`FrameServer::request`] at `prio` 0 for one of several pictures of the same target and
+    /// size shown at once: `view` names the picture (0 is [`FrameServer::request`]'s). A frame
+    /// on screen replaces only the one asked for before in its own view, so the Slip Monitor's
+    /// In and Out frames (one item, one size) don't cancel each other's decode on every refresh
+    /// while each still drops the positions the drag has left behind.
+    pub fn request_in_view(&self, key: FrameKey, time: Tick, scale: f32, project: &Arc<Project>, view: u32) {
+        self.request_job(key, time, scale, project, 0, false, Some(Tick::from_seconds_f64(SCRUB_KEEP_S)), view);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn request_job(&self, key: FrameKey, time: Tick, scale: f32, project: &Arc<Project>, prio: u32, prefetch: bool, catch_up: Option<Tick>, view: u32) {
         let hit = || self.shared.stats.lock().unwrap_or_else(|e| e.into_inner()).request_hits += 1;
         if self.shared.done.lock().unwrap_or_else(|e| e.into_inner()).map.contains_key(&key)
             || self.shared.plans.lock().unwrap_or_else(|e| e.into_inner()).map.contains_key(&key)
@@ -529,7 +541,7 @@ impl FrameServer {
             hit();
             return;
         }
-        if self.shared.in_flight.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|(k, c, _)| *k == key && !c.load(Ordering::Relaxed)) {
+        if self.shared.in_flight.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|(k, c, ..)| *k == key && !c.load(Ordering::Relaxed)) {
             hit();
             return;
         }
@@ -556,15 +568,14 @@ impl FrameServer {
             // dragged asks for a new revision per refresh) is left to finish: it needs the same
             // source frames, so it holds no decoder back, and when frames take longer than a
             // refresh, cancelling each one for the next would show nothing until the mouse rests.
-            let same_view = |k: &FrameKey| k.target == key.target && k.size == key.size;
-            q.retain(|j| !(j.prio == 0 && !j.prefetch && same_view(&j.key)));
-            for (k, c, prefetch) in self.shared.in_flight.lock().unwrap_or_else(|e| e.into_inner()).iter() {
-                if !prefetch && same_view(k) && k.frame != key.frame {
+            q.retain(|j| !(j.prio == 0 && !j.prefetch && same_view((&key, view), (&j.key, j.view))));
+            for (k, c, prefetch, v) in self.shared.in_flight.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+                if !prefetch && same_view((&key, view), (k, *v)) && k.frame != key.frame {
                     c.store(true, Ordering::Relaxed);
                 }
             }
         }
-        q.push_back(Job { key, queued: Instant::now(), cancel: Default::default(), prefetch, catch_up, time, scale, project: project.clone(), prio });
+        q.push_back(Job { key, queued: Instant::now(), cancel: Default::default(), prefetch, catch_up, time, scale, project: project.clone(), prio, view });
         drop(q);
         self.shared.cv.notify_one();
     }
@@ -583,7 +594,7 @@ impl FrameServer {
         let (lead, stride) = if preroll { (1, 1) } else { playback_plan(self.render_cost(), fps, self.shared.workers) };
         if lead <= 1 {
             // the frame due now; once the clock runs, the frames before it are late
-            self.request_job(key, rate.tick_of(key.frame), scale, project, 0, false, (!preroll && dir > 0).then_some(Tick::ZERO));
+            self.request_job(key, rate.tick_of(key.frame), scale, project, 0, false, (!preroll && dir > 0).then_some(Tick::ZERO), 0);
         }
         // During preroll the clock has not started: only the frames that gate start, not a
         // prefetch run that walks the rest of a LongGOP and evicts the playhead pictures.
@@ -593,7 +604,7 @@ impl FrameServer {
             if f >= 0 {
                 // forward play: frames before the playhead are late (reverse play skips nothing)
                 let late = (!preroll && dir > 0).then(|| rate.tick_of(f) - rate.tick_of(key.frame));
-                self.request_job(FrameKey { frame: f, ..key }, rate.tick_of(f), scale, project, i as u32 + 1, true, late);
+                self.request_job(FrameKey { frame: f, ..key }, rate.tick_of(f), scale, project, i as u32 + 1, true, late, 0);
             }
         }
         let (target, rev, cur) = (key.target, key.revision, key.frame);
@@ -618,7 +629,7 @@ impl FrameServer {
     /// would otherwise go on to decode a frame playback has passed, possibly from its keyframe.
     pub fn retain_queue(&self, keep: impl Fn(&FrameKey) -> bool) {
         self.shared.queue.lock().unwrap_or_else(|e| e.into_inner()).retain(|j| keep(&j.key));
-        for (k, c, _) in self.shared.in_flight.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        for (k, c, ..) in self.shared.in_flight.lock().unwrap_or_else(|e| e.into_inner()).iter() {
             if !keep(k) {
                 c.store(true, Ordering::Relaxed);
             }
@@ -629,7 +640,7 @@ impl FrameServer {
     /// they would keep the workers busy, e.g. rendering effects for frames nobody will see).
     pub fn stop_prefetch(&self) {
         self.shared.queue.lock().unwrap_or_else(|e| e.into_inner()).retain(|j| !j.prefetch);
-        for (_, c, prefetch) in self.shared.in_flight.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        for (_, c, prefetch, _) in self.shared.in_flight.lock().unwrap_or_else(|e| e.into_inner()).iter() {
             if *prefetch {
                 c.store(true, Ordering::Relaxed);
             }
@@ -790,7 +801,7 @@ fn worker(
         // monitors blank. Log it, forget the job and keep serving.
         let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_job(&sh, &job, &pool, &services, &previews)));
         if ran.is_err() {
-            sh.in_flight.lock().unwrap_or_else(|e| e.into_inner()).retain(|(k, c, _)| !(*k == job.key && Arc::ptr_eq(c, &job.cancel)));
+            sh.in_flight.lock().unwrap_or_else(|e| e.into_inner()).retain(|(k, c, ..)| !(*k == job.key && Arc::ptr_eq(c, &job.cancel)));
             sh.stats.lock().unwrap_or_else(|e| e.into_inner()).failed += 1;
             log::error!("frame job {:?} panicked; the worker continues", job.key);
         }
@@ -811,7 +822,7 @@ pub fn inject_job_panics(n: u32) {
 static INJECT_PANICS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 fn run_job(sh: &Shared, job: &Job, pool: &Arc<MediaPool>, services: &Arc<dyn Services>, previews: &PreviewStore) -> bool {
-    sh.in_flight.lock().unwrap_or_else(|e| e.into_inner()).push((job.key, job.cancel.clone(), job.prefetch));
+    sh.in_flight.lock().unwrap_or_else(|e| e.into_inner()).push((job.key, job.cancel.clone(), job.prefetch, job.view));
     if INJECT_PANICS.load(Ordering::Relaxed) > 0 && INJECT_PANICS.fetch_sub(1, Ordering::Relaxed) > 0 {
         crate::crash::injected_fault("injected frame-job fault");
     }
@@ -850,7 +861,7 @@ fn run_job(sh: &Shared, job: &Job, pool: &Arc<MediaPool>, services: &Arc<dyn Ser
         })
     });
     let cancelled = job.cancel.load(Ordering::Relaxed);
-    sh.in_flight.lock().unwrap_or_else(|e| e.into_inner()).retain(|(k, c, _)| !(*k == job.key && Arc::ptr_eq(c, &job.cancel)));
+    sh.in_flight.lock().unwrap_or_else(|e| e.into_inner()).retain(|(k, c, ..)| !(*k == job.key && Arc::ptr_eq(c, &job.cancel)));
     if job.prefetch {
         // Work beyond fetching source frames (decoding is sequential per source and is
         // not saved by skipping frames, so it is left out of the estimate). A cancelled job
@@ -973,10 +984,28 @@ fn render_job(job: &Job, pool: &Arc<MediaPool>, services: &Arc<dyn Services>, pr
     (rgba, false)
 }
 
+/// Whether two foreground requests are for the same picture on screen, so the newer replaces the
+/// older: the same view ([`FrameServer::request_in_view`]), target and size.
+fn same_view(a: (&FrameKey, u32), b: (&FrameKey, u32)) -> bool {
+    a.1 == b.1 && a.0.target == b.0.target && a.0.size == b.0.size
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{PlaybackMeter, Target, background_work, playback_plan};
+    use super::{FrameKey, PlaybackMeter, Target, background_work, playback_plan, same_view};
     use filmcraft_project::ItemId;
+
+    #[test]
+    fn a_request_replaces_only_its_own_views_older_frame() {
+        let key = |frame, size| FrameKey { target: Target::Item(ItemId(1)), frame, size, revision: 0, draft: false };
+        // the Trim Monitor at a cut inside one take: one item at one size in two pictures
+        assert!(!same_view((&key(120, 500), 2), (&key(119, 500), 1)), "the other picture's frame is kept");
+        assert!(same_view((&key(121, 500), 2), (&key(120, 500), 2)), "its own older frame is replaced");
+        assert!(same_view((&key(10, 500), 0), (&key(9, 500), 0)), "plain `request` is view 0");
+        assert!(!same_view((&key(10, 500), 0), (&key(9, 250), 0)), "another size is another picture");
+        let other = FrameKey { target: Target::Item(ItemId(2)), ..key(9, 500) };
+        assert!(!same_view((&key(10, 500), 0), (&other, 0)), "another item is another picture");
+    }
 
     #[test]
     fn only_item_thumbnails_are_background_work() {
