@@ -124,6 +124,9 @@ pub struct FrameStats {
     /// Jobs whose decode/render panicked (the worker survives; the frame is not cached).
     pub failed: u64,
     pub cancelled: u64,
+    /// Waiting jobs dropped before they started because a newer frame was asked for in their
+    /// view ([`FrameServer::request_in_view`]); running ones count as `cancelled`.
+    pub replaced: u64,
     /// Jobs served from a render preview.
     pub preview: u64,
     /// Playback prefetch jobs.
@@ -156,7 +159,7 @@ impl FrameStats {
         let n = self.jobs.max(1) as f64;
         let req = self.request_hits + self.request_misses;
         serde_json::json!({
-            "jobs": self.jobs, "cancelled": self.cancelled, "failedJobs": self.failed, "previewJobs": self.preview, "prefetchJobs": self.prefetch,
+            "jobs": self.jobs, "cancelled": self.cancelled, "replaced": self.replaced, "failedJobs": self.failed, "previewJobs": self.preview, "prefetchJobs": self.prefetch,
             "requestHitRate": if req == 0 { 0.0 } else { self.request_hits as f64 / req as f64 },
             "decodeMs": {"mean": self.source_ms / n, "p50": pct(&|r| r.0, 0.5), "p95": pct(&|r| r.0, 0.95)},
             "renderMs": {"mean": self.render_ms / n, "p50": pct(&|r| r.1, 0.5), "p95": pct(&|r| r.1, 0.95)},
@@ -525,9 +528,10 @@ impl FrameServer {
 
     /// [`FrameServer::request`] at `prio` 0 for one of several pictures of the same target and
     /// size shown at once: `view` names the picture (0 is [`FrameServer::request`]'s). A frame
-    /// on screen replaces only the one asked for before in its own view, so the Slip Monitor's
-    /// In and Out frames (one item, one size) don't cancel each other's decode on every refresh
-    /// while each still drops the positions the drag has left behind.
+    /// on screen replaces only the one asked for before in its own view, so the Trim Monitor's
+    /// outgoing and incoming pictures at a cut inside one take (one item, one size) don't cancel
+    /// each other's decode on every refresh while each still drops the positions a trim has left
+    /// behind.
     pub fn request_in_view(&self, key: FrameKey, time: Tick, scale: f32, project: &Arc<Project>, view: u32) {
         self.request_job(key, time, scale, project, 0, false, Some(Tick::from_seconds_f64(SCRUB_KEEP_S)), view);
     }
@@ -568,7 +572,9 @@ impl FrameServer {
             // dragged asks for a new revision per refresh) is left to finish: it needs the same
             // source frames, so it holds no decoder back, and when frames take longer than a
             // refresh, cancelling each one for the next would show nothing until the mouse rests.
+            let waiting = q.len();
             q.retain(|j| !(j.prio == 0 && !j.prefetch && same_view((&key, view), (&j.key, j.view))));
+            self.shared.stats.lock().unwrap_or_else(|e| e.into_inner()).replaced += waiting.saturating_sub(q.len()) as u64;
             for (k, c, prefetch, v) in self.shared.in_flight.lock().unwrap_or_else(|e| e.into_inner()).iter() {
                 if !prefetch && same_view((&key, view), (k, *v)) && k.frame != key.frame {
                     c.store(true, Ordering::Relaxed);
@@ -992,8 +998,11 @@ fn same_view(a: (&FrameKey, u32), b: (&FrameKey, u32)) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{FrameKey, PlaybackMeter, Target, background_work, playback_plan, same_view};
+    use super::{FrameKey, FrameServer, PlaybackMeter, Target, background_work, playback_plan, same_view};
     use filmcraft_project::ItemId;
+    use filmcraft_time::Tick;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     #[test]
     fn a_request_replaces_only_its_own_views_older_frame() {
@@ -1005,6 +1014,21 @@ mod tests {
         assert!(!same_view((&key(10, 500), 0), (&key(9, 250), 0)), "another size is another picture");
         let other = FrameKey { target: Target::Item(ItemId(2)), ..key(9, 500) };
         assert!(!same_view((&key(10, 500), 0), (&other, 0)), "another item is another picture");
+    }
+
+    #[test]
+    fn the_other_pictures_running_decode_survives_a_request() {
+        // The request path, with the Trim Monitor's outgoing picture (view 1) still decoding: a
+        // stand-in entry in `in_flight` that no worker owns, so no decode can finish it first.
+        let s = filmcraft_engine::Session::default();
+        let fs = FrameServer::new(s.media.clone(), s.services.clone(), s.previews.clone(), 1);
+        let key = |frame| FrameKey { target: Target::Item(ItemId(1)), frame, size: 500, revision: 0, draft: false };
+        let running = Arc::new(AtomicBool::new(false));
+        fs.shared.in_flight.lock().unwrap().push((key(120), running.clone(), false, 1));
+        fs.request_in_view(key(121), Tick::ZERO, 1.0, &s.project, 2);
+        assert!(!running.load(Ordering::Relaxed), "the incoming picture's request cancelled the outgoing one's decode");
+        fs.request_in_view(key(119), Tick::ZERO, 1.0, &s.project, 1);
+        assert!(running.load(Ordering::Relaxed), "a newer frame in its own view replaces it");
     }
 
     #[test]

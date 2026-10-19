@@ -96,12 +96,21 @@ fn demo_through_edit() -> Driver {
     d
 }
 
+/// Frame jobs given up so far for a newer request: cancelled while running or dropped while waiting.
+fn given_up(d: &Driver) -> u64 {
+    let s = d.harness.state().frames.stats();
+    s.cancelled + s.replaced
+}
+
 #[test]
 fn both_pictures_of_a_cut_inside_one_take_arrive_and_follow_a_roll() {
     let mut d = demo_through_edit();
     let (out, inc) = d.wanted();
     assert_eq!(inc, out + 1, "a through edit: the incoming picture is the outgoing one's next frame");
     assert!(d.settle(Duration::from_secs(20)).is_some(), "both pictures show their frames ({out}, {inc})");
+    // Nothing moved, so no decode was worth cancelling. With one view per item and size, each
+    // picture's request dropped or cancelled the other's decode: they still arrived, but late.
+    assert_eq!(given_up(&d), 0, "the two pictures gave up each other's decode");
     for _ in 0..6 {
         d.exec("trim.forward", json!({}));
     }
@@ -133,7 +142,7 @@ fn movie_4k(codec: &str, gop: u32) -> Option<std::path::PathBuf> {
 
 /// How long the Trim Monitor takes to show both frames of a cut inside one 4K take, when the edit
 /// point is selected and after a burst of roll steps (one per refresh, as holding a trim key
-/// does), and how many frame jobs were started and cancelled meanwhile. Prints the numbers:
+/// does), and how many frame jobs were started, and cancelled or dropped before starting, meanwhile. Prints the numbers:
 /// `cargo test --release -p filmcraft-ui-egui --test trim_monitor_frames_ui perf_ -- --ignored --nocapture`
 #[test]
 #[ignore]
@@ -156,7 +165,7 @@ fn perf_trim_monitor_4k_through_edit() {
         let mut d = Driver::new(session);
         let stats = |d: &Driver| {
             let s = d.harness.state().frames.stats();
-            (s.jobs, s.cancelled)
+            (s.jobs, s.cancelled + s.replaced)
         };
         let limit = Duration::from_secs(30);
         let (j0, c0) = stats(&d);
@@ -170,7 +179,7 @@ fn perf_trim_monitor_4k_through_edit() {
         let (j2, c2) = stats(&d);
         let ms = |t: Option<Duration>| t.map_or_else(|| format!("not within {} s", limit.as_secs()), |t| format!("{:.0} ms", t.as_secs_f64() * 1000.0));
         eprintln!(
-            "{codec} 4K GOP {gop}: both frames on screen {} after selecting the edit point ({} jobs, {} cancelled); {} after 12 roll steps ({} jobs, {} cancelled)",
+            "{codec} 4K GOP {gop}: both frames on screen {} after selecting the edit point ({} jobs, {} given up); {} after 12 roll steps ({} jobs, {} given up)",
             ms(select),
             j1 - j0,
             c1 - c0,
