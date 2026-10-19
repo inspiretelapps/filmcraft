@@ -533,6 +533,7 @@ impl FrameServer {
     /// each other's decode on every refresh while each still drops the positions a trim has left
     /// behind.
     pub fn request_in_view(&self, key: FrameKey, time: Tick, scale: f32, project: &Arc<Project>, view: u32) {
+        let view = view.min(SHARED_VIEW - 1);
         self.request_job(key, time, scale, project, 0, false, Some(Tick::from_seconds_f64(SCRUB_KEEP_S)), view);
     }
 
@@ -545,12 +546,23 @@ impl FrameServer {
             hit();
             return;
         }
-        if self.shared.in_flight.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|(k, c, ..)| *k == key && !c.load(Ordering::Relaxed)) {
+        // Another view asking for the same frame shares the job, which then belongs to neither:
+        // the first view moving on must not cancel a frame the other still shows.
+        let share = |v: &mut u32| {
+            if *v != view {
+                *v = SHARED_VIEW;
+            }
+        };
+        if let Some((.., v)) =
+            self.shared.in_flight.lock().unwrap_or_else(|e| e.into_inner()).iter_mut().find(|(k, c, ..)| *k == key && !c.load(Ordering::Relaxed))
+        {
+            share(v);
             hit();
             return;
         }
         let mut q = self.shared.queue.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(j) = q.iter_mut().find(|j| j.key == key) {
+            share(&mut j.view);
             j.prio = j.prio.min(prio);
             j.prefetch &= prefetch;
             // the playhead only moves on: the newest (smallest) margin
@@ -990,6 +1002,9 @@ fn render_job(job: &Job, pool: &Arc<MediaPool>, services: &Arc<dyn Services>, pr
     (rgba, false)
 }
 
+/// The view of a job asked for in more than one view: no view's newer frame replaces it.
+const SHARED_VIEW: u32 = u32::MAX;
+
 /// Whether two foreground requests are for the same picture on screen, so the newer replaces the
 /// older: the same view ([`FrameServer::request_in_view`]), target and size.
 fn same_view(a: (&FrameKey, u32), b: (&FrameKey, u32)) -> bool {
@@ -1029,6 +1044,22 @@ mod tests {
         assert!(!running.load(Ordering::Relaxed), "the incoming picture's request cancelled the outgoing one's decode");
         fs.request_in_view(key(119), Tick::ZERO, 1.0, &s.project, 1);
         assert!(running.load(Ordering::Relaxed), "a newer frame in its own view replaces it");
+    }
+
+    #[test]
+    fn a_decode_both_pictures_wait_for_survives_either_moving_on() {
+        // Both Trim Monitor pictures can show the same frame (the incoming clip starting on the
+        // outgoing one's last frame); a trim then moves one of them on while the other still waits.
+        let s = filmcraft_engine::Session::default();
+        let fs = FrameServer::new(s.media.clone(), s.services.clone(), s.previews.clone(), 1);
+        let key = |frame| FrameKey { target: Target::Item(ItemId(1)), frame, size: 500, revision: 0, draft: false };
+        let running = Arc::new(AtomicBool::new(false));
+        fs.shared.in_flight.lock().unwrap().push((key(120), running.clone(), false, 1));
+        fs.request_in_view(key(120), Tick::ZERO, 1.0, &s.project, 2);
+        fs.request_in_view(key(121), Tick::ZERO, 1.0, &s.project, 1);
+        assert!(!running.load(Ordering::Relaxed), "the outgoing picture moving on cancelled the frame the incoming one waits for");
+        fs.request_in_view(key(119), Tick::ZERO, 1.0, &s.project, 2);
+        assert!(!running.load(Ordering::Relaxed), "a shared decode is left to finish");
     }
 
     #[test]
